@@ -109,16 +109,19 @@ gini = function(x) { ## gini index: measure of the
   return(2/n*sum(seq_len(n)*y)/sum(y) - (n+1)/n)
 }
 
-dfvar = data_corr[, .(agb = sum(agb)/(6.25/4), 
-                      n = as.numeric(length(i_arbre)), 
-                      qmd = sqrt(sum((size_corr/pi)**2)/length(i_arbre)), 
-                      gini = gini(size_corr),
-                      rich = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 0), 
-                      shan = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 1), 
-                      simp = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 2)), 
-                  .(plot = n_parcelle, subplot = n_carre, year = campagne)]
-
-save(dfvar, file = "cache/dfvar.rda")
+if (!file.exists("cache/dfvar.rda")) {
+  dfvar = data_corr[, .(agb = sum(agb)/(6.25/4), 
+                        n = as.numeric(length(i_arbre)), 
+                        qmd = sqrt(sum((size_corr/pi)**2)/length(i_arbre)), 
+                        gini = gini(size_corr),
+                        rich = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 0), 
+                        shan = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 1), 
+                        simp = bcDiversity(Ns = data.frame(table(binomial_name))$Freq, q = 2)), 
+                    .(plot = n_parcelle, subplot = n_carre, year = campagne)]
+  
+  save(dfvar, file = "cache/dfvar.rda")
+} else 
+  load("cache/dfvar.rda")
 ```
 
 ## Reduce dimensions
@@ -165,7 +168,7 @@ g3 = ggplot(dfvar[year >=1990], aes(x = n, y = shan, color = as.factor(treat), g
 ggpubr::ggarrange(g1, g2, g3, nrow = 1)
 ``` 
 
-#### Exploring differential equations for AGB and N
+## Exploring differential equations for AGB and N
 
 ```{r rate-of-change}
 setorder(dfvar, plot, subplot, year)
@@ -195,6 +198,63 @@ ggplot(dfdiff, aes(x = value, y = dxdt, color = group)) +
   facet_grid(vardiff ~ variable, scales = "free")
 ```
 
+
+### Build model 
+
+
+$$\frac{dN}{dt} = r_{1} N  (1-\frac{N}{K_1} + \frac{\alpha_1 AGB}{K_1} )$$
+
+$$\frac{dAGB}{dt} = r_2 AGB (1-\frac{AGB}{K_2} + \frac{\alpha_{2} N}{K_2})$$
+
+```{r simulations-simple-model}
+library(deSolve)
+
+time <- seq(0, 100, by = 1)
+df0 <- expand.grid(n = c(800, 1000, 1200), 
+                   agb = c(150, 200, 300), 
+                   r_n = 0.1, 
+                   K_n = 1000, 
+                   a_n = c(-0.5, 0, 0.5), 
+                   r_b = 0.005, 
+                   K_b = 200, 
+                   a_b = c(-0.5, 0, 0.5))
+
+# p <- c()
+
+model_logistic_expl <- function(t, y, p) {
+  n <- y[1]
+  agb <- y[2]
+  dn_dt <-   p[1] * n   * (1 - n   / p[2] + p[3] / p[2] * agb ) 
+  dagb_dt <- p[4] * agb * (1 - agb / p[5] + p[6] / p[5] * n   )
+  return(list(c(dn_dt, dagb_dt)))
+}
+
+dyn_t <-
+  lapply(seq_len(nrow(df0)), function(i)
+    data.table(ode(y = unlist(df0[i, c("n", "agb")]), 
+                   times = time, model_logistic_expl, 
+                   unlist(df0[i, c("r_n", "K_n", "a_n", 
+                                   "r_b", "K_b", "a_b")]))))
+dyn_t <- rbindlist(dyn_t, idcol = "simu")
+
+colnames(df0)[1:2] = c("n0", "agb0")
+df0$simu = seq_len(nrow(df0))
+dyn_t <- merge(dyn_t, df0)
+dyn_t$simu_name <- paste("agb0 =", dyn_t$agb0, "; n0 =", dyn_t$n0)
+
+ggplot(dyn_t, aes(x = time, y = n, color = simu_name)) + 
+  geom_line() + 
+  facet_grid(paste("a_n =", a_n) ~ paste("a_b =", a_b))
+ggplot(dyn_t, aes(x = time, y = agb, color = simu_name)) + 
+  geom_line() + 
+  facet_grid(paste("a_n =", a_n) ~ paste("a_b =", a_b))
+ggplot(dyn_t, aes(x = agb, y = n, color = simu_name)) + 
+  geom_line() + 
+  geom_point(data = subset(dyn_t, time == 0)) + 
+  facet_grid(paste("a_n =", a_n) ~ paste("a_b =", a_b))
+```
+
+
 ### Fit stan model
 
 ```{r stan-diffeq}
@@ -221,14 +281,10 @@ if (!file.exists("stan/fit_simple-model_agb-n.rda")) {
 ```
 
 
-### Simulate system with only N and AGB
+### Observations vs predictions
 
-$$\frac{dN}{dt} = r_{1} \cdot N  (1-\frac{N}{K_1}) + \theta_1\cdot AGB$$
 
-$$\frac{dAGB}{dt} = r_2 \cdot AGB (1-\frac{AGB}{K_2}) + \theta_{2} \cdot N$$
-```{r simulations-simple-model}
-library(deSolve)
-
+```{r gof1-simple-model}
 time <- seq(0, 100, by = 1)
 y0 <- expand.grid(n = c(800, 1000, 1200), 
                   agb = c(150, 200, 300))
@@ -237,18 +293,10 @@ pars_stan = rstan::extract(simple_model)
 maxl = which.max(pars_stan$lp__)
 p <- c(r_n = pars_stan$r_n[maxl], 
        K_n = pars_stan$K_n[maxl], 
-       lambda_n = pars_stan$lambda_n[maxl], 
+       a_n = pars_stan$a_n[maxl], 
        r_b = pars_stan$r_b[maxl], 
        K_b = pars_stan$K_b[maxl], 
-       lambda_b = pars_stan$lambda_b[maxl])
-
-model_logistic_expl <- function(t, y, p) {
-  n <- y[1]
-  agb <- y[2]
-  dn_dt <- p[1] * n * (1 - n / p[2]) + p[3] * agb 
-  dagb_dt <-p[4] * agb * (1 - agb / p[5]) + p[6] * n
-  return(list(c(dn_dt, dagb_dt)))
-}
+       a_b = pars_stan$a_b[maxl])
 
 dyn_t <-
   lapply(seq_len(nrow(y0)), function(i)
@@ -264,61 +312,57 @@ ggplot(dyn_t, aes(x = time, y = n, color = simu_name)) +
   geom_line()
 ggplot(dyn_t, aes(x = time, y = agb, color = simu_name)) + 
   geom_line()
-  ggplot(dyn_t, aes(x = agb, y = n, color = simu_name)) + 
+ggplot(dyn_t, aes(x = agb, y = n, color = simu_name)) + 
   geom_line() + 
   geom_point(data = subset(dyn_t, time == 0))
 ```
 
-```{r obs-vs-simulations-simple-model}
-dfsub = subset(dfvar, !is.na(dndt) & !(year < 1990 & treat > 0))
-df0 = dfsub[, .(year = min(year)), .(plot, subplot)]
-df0 = merge(df0, dfvar[, c("plot", "subplot", "year", "agb", "n")], 
+```{r obs-vs-simulations-simple-model, fig.height = 12, fig.width = 10}
+dfsub = subset(dfvar, !is.na(dndt) & !(year <= 1990 & treat > 0))
+df0 = dfsub[, .(year = min(year), tmax = diff(range(year))), .(plot, subplot)]
+df0 = merge(df0, dfvar[, c("plot", "subplot", "year", "n", "agb")], 
             by = c("plot", "subplot", "year"))
 df0$idplot = paste(df0$plot, df0$subplot, sep = "_")
 
-time_simu <- seq(0, 40, by = 0.1)
-pars_stan <- rstan::extract(simple_model)
-maxl <- which.max(pars_stan$lp__)
-p <- c(r_n = pars_stan$r_n[maxl], 
-       K_n = pars_stan$K_n[maxl], 
-       lambda_n = pars_stan$lambda_n[maxl], 
-       r_b = pars_stan$r_b[maxl], 
-       K_b = pars_stan$K_b[maxl], 
-       lambda_b = pars_stan$lambda_b[maxl])
-
-model_logistic_expl <- function(t, y, p) {
-  n <- y[1]
-  agb <- y[2]
-  dn_dt <- p[1] * n * (1 - n / p[2]) + p[3] * agb 
-  dagb_dt <-p[4] * agb * (1 - agb / p[5]) + p[6] * n
-  return(c(dn_dt, dagb_dt))
-}
-
 dyn_t <-
-  lapply(df0$idplot, function(i) {
-    y = df0[idplot==i, c("n", "agb")]
-    for (ts in time_simu[-1]) {
-      yt = y[nrow(y),]
-      y = rbind(y, yt + model_logistic_expl(ts, unlist(yt), p))
-    } 
-    return(y)
-  })
-    
-### problem: n can be negative!!
+  lapply(seq_len(nrow(df0)), function(i)
+    data.table(ode(y = unlist(df0[i, c("n", "agb")]), 
+                   times = seq(0, df0$tmax[i], by = 1), 
+                   model_logistic_expl, p)))
+names(dyn_t) <- df0$idplot
 dyn_t <- rbindlist(dyn_t, idcol = "idplot")
 
-colnames(y0) = c("n0", "agb0")
-y0$simu = seq_len(nrow(y0))
-dyn_t <- merge(dyn_t, y0)
-dyn_t$simu_name <- paste("agb0 =", dyn_t$agb0, "; n0 =", dyn_t$n0)
+colnames(df0)[colnames(df0) %in% c("n", "agb")] <- 
+  paste0(colnames(df0)[colnames(df0) %in% c("n", "agb")], 0)
+dyn_t <- merge(dyn_t, df0, by = "idplot")
 
-ggplot(dyn_t, aes(x = time, y = n, color = simu_name)) + 
-  geom_line()
-ggplot(dyn_t, aes(x = time, y = agb, color = simu_name)) + 
-  geom_line()
-  ggplot(dyn_t, aes(x = agb, y = n, color = simu_name)) + 
+ggplot(dyn_t, aes(x = agb, y = n, color = as.factor(subplot))) + 
   geom_line() + 
-  geom_point(data = subset(dyn_t, time == 0))
+  geom_point(data = subset(dyn_t, time == 0), shape = 3) + 
+  geom_point(data = dfsub) +
+  facet_wrap(~ plot, scales = "free")
+```
+
+```{r}
+dfsub[, time := year - min(year)]
+dfobs = melt(dfsub, id.vars = c("plot", "subplot", "time", "treat"), 
+             measure.vars = c("n", "agb", "dndt", "dagbdt"), value.name = "obs")
+
+dfpred = melt(dyn_t, id.vars = c("plot", "subplot", "time"), 
+             measure.vars = c("n", "agb"), value.name = "pred")
+dfsub$p_dndt = p[1] * dfsub$n   * (1 - dfsub$n   / p[2] + p[3] / p[2] * dfsub$agb )
+dfsub$p_dagbdt = p[4] * dfsub$agb * (1 - dfsub$agb / p[5] + p[6] / p[5] * dfsub$n ) 
+dfpred2 = melt(dfsub, id.vars = c("plot", "subplot", "time"), 
+             measure.vars = c("p_dndt", "p_dagbdt"), value.name = "pred")
+dfpred2$variable = gsub("p_", "", dfpred2$variable)
+dfpred = rbind(dfpred, dfpred2)
+  
+dfgof = merge(dfpred, dfobs)
+
+ggplot(dfgof, aes(x = obs, y = pred, color = as.factor(treat))) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, lty = 2) +
+  facet_wrap(~ variable, scales = "free")
 ```
 
 

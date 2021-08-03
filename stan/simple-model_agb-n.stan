@@ -12,10 +12,10 @@ data {
 parameters {
   real<lower=0> r_n; 
   real<lower=0> K_n; 
-  real lambda_n;
+  real a_n;
   real<lower=0> r_b; 
   real<lower=0> K_b; 
-  real lambda_b;
+  real a_b;
   
   real<lower=0> sigma_n;
   real<lower=0> sigma_b;
@@ -26,8 +26,8 @@ transformed parameters {
   vector[N] mu_b;
   
   for (i in 1:N ) {
-  mu_n[i] = r_n * n[i] * ( 1 - n[i] / K_n ) + lambda_n * b[i] ;
-  mu_b[i] = r_b * b[i] * ( 1 - b[i] / K_b ) + lambda_b * n[i] ;
+  mu_n[i] = r_n * n[i] * ( 1 - n[i] / K_n + a_n / K_n * b[i] ) ;
+  mu_b[i] = r_b * b[i] * ( 1 - b[i] / K_b + a_b / K_b * n[i] ) ;
   }
   
 }
@@ -42,6 +42,8 @@ model {
   // priors
   K_n ~ normal(1000, 500);
   K_b ~ normal(400, 100);
+  a_n ~ normal(0,1);
+  a_b ~ normal(0,1);
   sigma_n ~ normal(0,1);
   sigma_b ~ normal(0,1);
 }
