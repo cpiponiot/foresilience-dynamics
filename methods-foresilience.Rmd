@@ -6,15 +6,17 @@ output: html_document
 ---
 
 ```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, results='hide')
+
 ## install and load packages ##
 packages_needed = c("data.table", "ggplot2", "entropart")
 packages_to_install = packages_needed[!( packages_needed %in% rownames(installed.packages()))]
 if (length(packages_to_install) > 0)
   install.packages(packages_to_install)
 lapply(packages_needed, require, character.only = TRUE)
-# library(rstan)
-# rstan_options(auto_write = TRUE)
-# options(mc.cores = parallel::detectCores())
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
 # from github
 if (!require(ForestData)){
   remotes::install_github("EcoFoG/ForestData")
@@ -283,6 +285,7 @@ if (!file.exists("stan/fit_simple-model_agb-n.rda")) {
 
 ### Observations vs predictions
 
+#### Deterministic predictions
 
 ```{r gof1-simple-model}
 time <- seq(0, 100, by = 1)
@@ -349,14 +352,14 @@ dfobs = melt(dfsub, id.vars = c("plot", "subplot", "time", "treat"),
              measure.vars = c("n", "agb", "dndt", "dagbdt"), value.name = "obs")
 
 dfpred = melt(dyn_t, id.vars = c("plot", "subplot", "time"), 
-             measure.vars = c("n", "agb"), value.name = "pred")
+              measure.vars = c("n", "agb"), value.name = "pred")
 dfsub$p_dndt = p[1] * dfsub$n   * (1 - dfsub$n   / p[2] + p[3] / p[2] * dfsub$agb )
 dfsub$p_dagbdt = p[4] * dfsub$agb * (1 - dfsub$agb / p[5] + p[6] / p[5] * dfsub$n ) 
 dfpred2 = melt(dfsub, id.vars = c("plot", "subplot", "time"), 
-             measure.vars = c("p_dndt", "p_dagbdt"), value.name = "pred")
+               measure.vars = c("p_dndt", "p_dagbdt"), value.name = "pred")
 dfpred2$variable = gsub("p_", "", dfpred2$variable)
 dfpred = rbind(dfpred, dfpred2)
-  
+
 dfgof = merge(dfpred, dfobs)
 
 ggplot(dfgof, aes(x = obs, y = pred, color = as.factor(treat))) +
@@ -365,4 +368,99 @@ ggplot(dfgof, aes(x = obs, y = pred, color = as.factor(treat))) +
   facet_wrap(~ variable, scales = "free")
 ```
 
+#### Introducting stochasticity in the predictions
+
+
+```{r gof1-simple-model}
+time <- seq(0, 100, by = 1)
+y0 <- expand.grid(n = c(800, 1000, 1200), 
+                  agb = c(150, 200, 300))
+
+sigmas = c(sigma_n = pars_stan$sigma_n[maxl], 
+           sigma_b = pars_stan$sigma_b[maxl])
+
+model_logistic_stoc = function(t, y, p, sdev) {
+  n <- y[1]
+  agb <- y[2]
+  dn_dt <-   p[1] * n   * (1 - n   / p[2] + p[3] / p[2] * agb ) 
+  dagb_dt <- p[4] * agb * (1 - agb / p[5] + p[6] / p[5] * n   )
+  dn_dt <- rnorm(1, dn_dt, sigma_n)
+  dagb_dt <- rnorm(1, dagb_dt, sigma_b)
+  return(c(dn_dt, dagb_dt))
+}
+
+dyn_t <-
+  lapply(seq_len(nrow(y0)), function(i) {
+    mat = y0[i,]
+    for (ts in time[-1]) {
+      yt = unlist(mat[nrow(mat),])
+      dxdt = model_logistic_stoc(ts, yt, p, sigmas)
+      mat = rbind(mat, yt + dxdt)
+    }
+    setDT(mat)
+    mat$time = time
+    return(mat)
+  })
+dyn_t <- rbindlist(dyn_t, idcol = "simu")
+
+colnames(y0) = c("n0", "agb0")
+y0$simu = seq_len(nrow(y0))
+dyn_t <- merge(dyn_t, y0)
+dyn_t$simu_name <- paste("agb0 =", dyn_t$agb0, "; n0 =", dyn_t$n0)
+
+ggplot(dyn_t, aes(x = time, y = n, color = simu_name)) + 
+  geom_line()
+ggplot(dyn_t, aes(x = time, y = agb, color = simu_name)) + 
+  geom_line()
+ggplot(dyn_t, aes(x = agb, y = n, color = simu_name)) + 
+  geom_line() + 
+  geom_point(data = subset(dyn_t, time == 0))
+```
+
+```{r obs-vs-simulations-simple-model, fig.height = 12, fig.width = 10}
+dfsub <- subset(dfvar, !is.na(dndt) & !(year <= 1990 & treat > 0))
+df0 <- dfsub[, .(year = min(year), tmax = diff(range(year))), .(plot, subplot)]
+df0 <- merge(df0, dfvar[, c("plot", "subplot", "year", "n", "agb")], 
+             by = c("plot", "subplot", "year"))
+df0$idplot <- paste(df0$plot, df0$subplot, sep = "_")
+
+dyn_t <- lapply(1:100, function(simu) {
+  dyn_simu <-
+    lapply(seq_len(nrow(df0)), function(i) {
+      mat = df0[i, c("n", "agb")]
+      for (ts in seq(1, df0$tmax[i], by = 1)) {
+        yt = unlist(mat[nrow(mat),])
+        dxdt = model_logistic_stoc(ts, yt, p, sigmas)
+        mat = rbind(mat, t(yt + dxdt))
+      }
+      setDT(mat)
+      mat$time = seq(0, df0$tmax[i], by = 1)
+      return(mat)
+    })
+  names(dyn_simu) <- df0$idplot
+  dyn_simu <- rbindlist(dyn_simu, idcol = "idplot")
+  return(dyn_simu)
+})
+dyn_t <- rbindlist(dyn_t, idcol = "simu")
+
+colnames(df0)[colnames(df0) %in% c("n", "agb")] <- 
+  paste0(colnames(df0)[colnames(df0) %in% c("n", "agb")], 0)
+dyn_t <- merge(dyn_t, df0, by = "idplot")
+
+dyn_summary <- dyn_t[, .(n_lwr = quantile(n, 0.025), 
+                         n_med = quantile(n, 0.5),
+                         n_upr = quantile(n, 0.975), 
+                         agb_lwr = quantile(agb, 0.025), 
+                         agb_med = quantile(agb, 0.5),
+                         agb_upr = quantile(agb, 0.975)), 
+                     .(plot, subplot, time, year)]
+
+ggplot(dyn_summary, aes(x = agb_med, y = n_med, color = as.factor(subplot))) + 
+  geom_line() + 
+  geom_line(aes(x = agb_lwr, y = n_lwr), lty=2) + 
+  geom_line(aes(x = agb_upr, y = n_upr), lty=2) + 
+  geom_point(data = subset(dyn_summary, time == 0), shape = 3) + 
+  geom_point(data = dfsub, aes(x= agb, y = n)) +
+  facet_wrap(~ plot, scales = "free")
+```
 
